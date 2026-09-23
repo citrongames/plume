@@ -1674,7 +1674,13 @@ namespace plume {
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
 #if defined(__ANDROID__)
-            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateGraphicsPipelines failed: VkResult=%d", static_cast<int>(res));
+            const auto shaderHash = [](const RenderShader *shader) -> unsigned long long {
+                return shader != nullptr ? static_cast<unsigned long long>(static_cast<const VulkanShader *>(shader)->sourceHash) : 0ULL;
+            };
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan",
+                "vkCreateGraphicsPipelines failed: VkResult=%d, VS=%016llx, GS=%016llx, PS=%016llx, targets=%u, samples=%u",
+                static_cast<int>(res), shaderHash(desc.vertexShader), shaderHash(desc.geometryShader),
+                shaderHash(desc.pixelShader), desc.renderTargetCount, desc.multisampling.sampleCount);
 #endif
             return;
         }
@@ -2230,6 +2236,14 @@ namespace plume {
 
         if (compatibleSurfaceFormats.empty()) {
             fprintf(stderr, "No compatible surface formats were found.\n");
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "No compatible surface format: requested=%d, available=%u",
+                int(requestedFormat), surfaceFormatCount);
+            for (const VkSurfaceFormatKHR &surfaceFormat : surfaceFormats) {
+                __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "Available surface format=%d, colorSpace=%d",
+                    int(surfaceFormat.format), int(surfaceFormat.colorSpace));
+            }
+#endif
             return;
         }
 
