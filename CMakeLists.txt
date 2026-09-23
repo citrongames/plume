@@ -13,11 +13,15 @@ if(APPLE)
     enable_language(OBJC OBJCXX)
 endif()
 
-string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Linux" IS_LINUX)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID)
+    set(IS_LINUX_OR_ANDROID TRUE)
+else()
+    set(IS_LINUX_OR_ANDROID FALSE)
+endif()
 
 # Project options
 include(CMakeDependentOption)
-cmake_dependent_option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF IS_LINUX OFF)
+cmake_dependent_option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF IS_LINUX_OR_ANDROID OFF)
 cmake_dependent_option(PLUME_D3D12_AGILITY_SDK_ENABLED "Enable D3D12 Agility SDK" OFF WIN32 OFF)
 cmake_dependent_option(PLUME_APPLE_RETINA_ENABLED "Enable Apple Retina display support" ON APPLE ON)
 option(PLUME_BUILD_EXAMPLES "Build example applications" OFF)
