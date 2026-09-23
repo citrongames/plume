@@ -13,6 +13,11 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <cstdlib>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include <unordered_map>
 
 #if DLSS_ENABLED
@@ -1266,6 +1271,9 @@ namespace plume {
         VkResult res = vkCreatePipelineLayout(device->vk, &layoutInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreatePipelineLayout failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreatePipelineLayout failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
     }
@@ -1300,6 +1308,9 @@ namespace plume {
         VkResult res = vkCreateShaderModule(device->vk, &shaderInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateShaderModule failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateShaderModule failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
     }
@@ -1393,6 +1404,9 @@ namespace plume {
         VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateComputePipelines failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
     }
@@ -1652,6 +1666,9 @@ namespace plume {
         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateGraphicsPipelines failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
     }
@@ -2940,17 +2957,35 @@ namespace plume {
     }
 
     void VulkanCommandList::setPipeline(const RenderPipeline *pipeline) {
+#if defined(__ANDROID__)
+        if (pipeline == nullptr) {
+            __android_log_print(ANDROID_LOG_FATAL, "Dora64Vulkan", "Attempted to bind a null pipeline object");
+            std::abort();
+        }
+#endif
         assert(pipeline != nullptr);
 
         const VulkanPipeline *interfacePipeline = static_cast<const VulkanPipeline *>(pipeline);
         switch (interfacePipeline->type) {
         case VulkanPipeline::Type::Compute: {
             const VulkanComputePipeline *computePipeline = static_cast<const VulkanComputePipeline *>(interfacePipeline);
+#if defined(__ANDROID__)
+            if (computePipeline->vk == VK_NULL_HANDLE) {
+                __android_log_print(ANDROID_LOG_FATAL, "Dora64Vulkan", "Attempted to bind a failed compute pipeline");
+                std::abort();
+            }
+#endif
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
             break;
         }
         case VulkanPipeline::Type::Graphics: {
             const VulkanGraphicsPipeline *graphicsPipeline = static_cast<const VulkanGraphicsPipeline *>(interfacePipeline);
+#if defined(__ANDROID__)
+            if (graphicsPipeline->vk == VK_NULL_HANDLE) {
+                __android_log_print(ANDROID_LOG_FATAL, "Dora64Vulkan", "Attempted to bind a failed graphics pipeline");
+                std::abort();
+            }
+#endif
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline->vk);
             break;
         }
