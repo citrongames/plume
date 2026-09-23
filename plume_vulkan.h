@@ -141,6 +141,9 @@ namespace plume {
     struct VulkanShader : RenderShader {
         VkShaderModule vk = VK_NULL_HANDLE;
         std::string entryPointName;
+#if defined(__ANDROID__)
+        uint64_t sourceHash = 0;
+#endif
         VulkanDevice *device = nullptr;
         RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
 

@@ -1300,6 +1300,13 @@ namespace plume {
         this->device = device;
         this->format = format;
         this->entryPointName = (entryPointName != nullptr) ? std::string(entryPointName) : std::string();
+#if defined(__ANDROID__)
+        sourceHash = UINT64_C(14695981039346656037);
+        const auto *bytes = static_cast<const uint8_t *>(data);
+        for (uint64_t i = 0; i < size; i++) {
+            sourceHash = (sourceHash ^ bytes[i]) * UINT64_C(1099511628211);
+        }
+#endif
 
         VkShaderModuleCreateInfo shaderInfo = {};
         shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1309,7 +1316,7 @@ namespace plume {
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateShaderModule failed with error code 0x%X.\n", res);
 #if defined(__ANDROID__)
-            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateShaderModule failed: VkResult=%d", static_cast<int>(res));
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateShaderModule failed: VkResult=%d, shaderHash=%016llx", static_cast<int>(res), static_cast<unsigned long long>(sourceHash));
 #endif
             return;
         }
@@ -1405,7 +1412,7 @@ namespace plume {
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
 #if defined(__ANDROID__)
-            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateComputePipelines failed: VkResult=%d", static_cast<int>(res));
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateComputePipelines failed: VkResult=%d, shaderHash=%016llx", static_cast<int>(res), static_cast<unsigned long long>(computeShader->sourceHash));
 #endif
             return;
         }
