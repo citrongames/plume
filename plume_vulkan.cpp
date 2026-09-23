@@ -24,7 +24,7 @@
 #   include "render/plume_dlss.h"
 #endif
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) && !defined(__ANDROID__)
 #   define VULKAN_VALIDATION_LAYER_ENABLED
 #   define VULKAN_OBJECT_NAMES_ENABLED
 #endif
@@ -4509,6 +4509,9 @@ namespace plume {
         VkResult res = volkInitialize();
         if (res != VK_SUCCESS) {
             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "volkInitialize failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
 
@@ -4517,7 +4520,31 @@ namespace plume {
         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.pEngineName = "plume";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.apiVersion = VK_API_VERSION_1_2;
+        uint32_t availableInstanceVersion = VK_API_VERSION_1_0;
+        if (vkEnumerateInstanceVersion != nullptr) {
+            res = vkEnumerateInstanceVersion(&availableInstanceVersion);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vkEnumerateInstanceVersion failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+                __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkEnumerateInstanceVersion failed: VkResult=%d", static_cast<int>(res));
+#endif
+                return;
+            }
+        }
+
+        // The device path uses core Vulkan 1.1 feature queries. Request no more than
+        // the loader supports; requiring 1.2 rejects otherwise compatible devices.
+        if (availableInstanceVersion < VK_API_VERSION_1_1) {
+            fprintf(stderr, "Vulkan 1.1 is required by Plume.\n");
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "Vulkan loader supports only version %u.%u", VK_API_VERSION_MAJOR(availableInstanceVersion), VK_API_VERSION_MINOR(availableInstanceVersion));
+#endif
+            return;
+        }
+        appInfo.apiVersion = std::min(availableInstanceVersion, uint32_t(VK_API_VERSION_1_2));
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "Dora64Vulkan", "Requesting Vulkan instance version %u.%u", VK_API_VERSION_MAJOR(appInfo.apiVersion), VK_API_VERSION_MINOR(appInfo.apiVersion));
+#endif
 
         VkInstanceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -4581,6 +4608,11 @@ namespace plume {
             }
 
             fprintf(stderr, "Unable to create instance. Required extensions are missing.\n");
+#if defined(__ANDROID__)
+            for (const std::string &extension : missingRequiredExtensions) {
+                __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "Missing required instance extension: %s", extension.c_str());
+            }
+#endif
             return;
         }
 
@@ -4618,6 +4650,9 @@ namespace plume {
         res = vkCreateInstance(&createInfo, nullptr, &instance);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateInstance failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
 
