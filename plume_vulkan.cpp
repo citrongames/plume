@@ -895,7 +895,8 @@ namespace plume {
         }
 
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X.\n", res);
+            fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X, size=%llu, usage=0x%X, heap=%u.\n",
+                res, (unsigned long long)bufferInfo.size, bufferInfo.usage, (unsigned)desc.heapType);
             return;
         }
     }
