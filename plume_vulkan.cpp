@@ -2633,13 +2633,16 @@ namespace plume {
             depthReference.attachment = uint32_t(attachments.size());
             depthReference.layout = desc.depthAttachmentReadOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-            // Upgrade the operations to NONE if supported. Fixes the following validation issue: https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/2349
-            // We prefer to just ignore this potential hazard on older Vulkan versions as it just seems to be an edge case for some hardware.
+            // Read-only depth/stencil still needs its previous contents for depth tests.
+            // LOAD_OP_NONE makes them undefined inside the render pass. Only the store
+            // can be omitted: read-only attachments do not modify the loaded values.
+            // STORE_OP_NONE also avoids the read/store hazard described in:
+            // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/2349
             const bool preferNoneForReadOnly = desc.depthAttachmentReadOnly && device->loadStoreOpNoneSupported;
             VkAttachmentDescription attachment = {};
             attachment.format = toVk(depthAttachmentViewDesc.format);
             attachment.samples = VkSampleCountFlagBits(depthAttachment->desc.multisampling.sampleCount);
-            attachment.loadOp = preferNoneForReadOnly ? VK_ATTACHMENT_LOAD_OP_NONE_EXT : VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             attachment.storeOp = preferNoneForReadOnly ? VK_ATTACHMENT_STORE_OP_NONE_EXT : VK_ATTACHMENT_STORE_OP_STORE;
             attachment.stencilLoadOp = attachment.loadOp;
             attachment.stencilStoreOp = attachment.storeOp;
