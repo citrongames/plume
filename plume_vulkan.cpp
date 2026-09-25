@@ -13,13 +13,22 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <cstdlib>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#if defined(PLUME_SDL_VULKAN_ENABLED)
+#include <android/native_window_jni.h>
+#include <SDL_system.h>
+#endif
+#endif
 #include <unordered_map>
 
 #if DLSS_ENABLED
 #   include "render/plume_dlss.h"
 #endif
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) && !defined(__ANDROID__)
 #   define VULKAN_VALIDATION_LAYER_ENABLED
 #   define VULKAN_OBJECT_NAMES_ENABLED
 #endif
@@ -890,7 +899,8 @@ namespace plume {
         }
 
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X.\n", res);
+            fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X, size=%llu, usage=0x%X, heap=%u.\n",
+                res, (unsigned long long)bufferInfo.size, bufferInfo.usage, (unsigned)desc.heapType);
             return;
         }
     }
@@ -1266,6 +1276,9 @@ namespace plume {
         VkResult res = vkCreatePipelineLayout(device->vk, &layoutInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreatePipelineLayout failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreatePipelineLayout failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
     }
@@ -1292,6 +1305,13 @@ namespace plume {
         this->device = device;
         this->format = format;
         this->entryPointName = (entryPointName != nullptr) ? std::string(entryPointName) : std::string();
+#if defined(__ANDROID__)
+        sourceHash = UINT64_C(14695981039346656037);
+        const auto *bytes = static_cast<const uint8_t *>(data);
+        for (uint64_t i = 0; i < size; i++) {
+            sourceHash = (sourceHash ^ bytes[i]) * UINT64_C(1099511628211);
+        }
+#endif
 
         VkShaderModuleCreateInfo shaderInfo = {};
         shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1300,6 +1320,9 @@ namespace plume {
         VkResult res = vkCreateShaderModule(device->vk, &shaderInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateShaderModule failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateShaderModule failed: VkResult=%d, shaderHash=%016llx", static_cast<int>(res), static_cast<unsigned long long>(sourceHash));
+#endif
             return;
         }
     }
@@ -1393,6 +1416,9 @@ namespace plume {
         VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateComputePipelines failed: VkResult=%d, shaderHash=%016llx", static_cast<int>(res), static_cast<unsigned long long>(computeShader->sourceHash));
+#endif
             return;
         }
     }
@@ -1652,6 +1678,15 @@ namespace plume {
         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            const auto shaderHash = [](const RenderShader *shader) -> unsigned long long {
+                return shader != nullptr ? static_cast<unsigned long long>(static_cast<const VulkanShader *>(shader)->sourceHash) : 0ULL;
+            };
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan",
+                "vkCreateGraphicsPipelines failed: VkResult=%d, VS=%016llx, GS=%016llx, PS=%016llx, targets=%u, samples=%u",
+                static_cast<int>(res), shaderHash(desc.vertexShader), shaderHash(desc.geometryShader),
+                shaderHash(desc.pixelShader), desc.renderTargetCount, desc.multisampling.sampleCount);
+#endif
             return;
         }
     }
@@ -2073,6 +2108,66 @@ namespace plume {
 
     // VulkanSwapChain
 
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+    int SDLCALL VulkanSwapChain::androidEventWatch(void *userdata, SDL_Event *event) {
+        auto *swapChain = static_cast<VulkanSwapChain *>(userdata);
+        if (event->type == SDL_APP_WILLENTERBACKGROUND) {
+            swapChain->androidBackground.store(true, std::memory_order_release);
+        }
+        else if (event->type == SDL_APP_DIDENTERFOREGROUND) {
+            swapChain->androidSurfaceGeneration.fetch_add(1, std::memory_order_acq_rel);
+            swapChain->androidBackground.store(false, std::memory_order_release);
+        }
+        return 1;
+    }
+
+    bool VulkanSwapChain::recreateAndroidSurface() {
+        // SDL's native_window can be released/replaced by the Java UI thread.
+        // Obtain our own reference from its current Java Surface instead of
+        // reading SDL's unprotected driverdata on the presentation thread.
+        auto *env = static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
+        if (env == nullptr) {
+            return false;
+        }
+        if (env->PushLocalFrame(4) < 0) {
+            env->ExceptionClear();
+            return false;
+        }
+        jobject activity = static_cast<jobject>(SDL_AndroidGetActivity());
+        jclass activityClass = activity ? env->GetObjectClass(activity) : nullptr;
+        jmethodID getSurface = activityClass ? env->GetStaticMethodID(activityClass,
+            "getNativeSurface", "()Landroid/view/Surface;") : nullptr;
+        jobject javaSurface = getSurface ? env->CallStaticObjectMethod(activityClass, getSurface) : nullptr;
+        ANativeWindow *window = nullptr;
+        if (!env->ExceptionCheck() && javaSurface) {
+            window = ANativeWindow_fromSurface(env, javaSurface);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        env->PopLocalFrame(nullptr);
+        if (window == nullptr) {
+            return false;
+        }
+
+        VkAndroidSurfaceCreateInfoKHR info = {};
+        info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        info.window = window;
+        VkSurfaceKHR newSurface = VK_NULL_HANDLE;
+        const VkResult result = vkCreateAndroidSurfaceKHR(
+            commandQueue->device->renderInterface->instance, &info, nullptr, &newSurface);
+        if (result != VK_SUCCESS) {
+            ANativeWindow_release(window);
+            return false;
+        }
+        surface = newSurface;
+        recoveredAndroidWindow = window;
+        androidSurfaceLost = false;
+        fprintf(stderr, "Dora64 Vulkan: Android surface recreated.\n");
+        return true;
+    }
+#endif
+
     VulkanSwapChain::VulkanSwapChain(VulkanCommandQueue *commandQueue, const RenderSwapChainDesc &desc) {
         assert(commandQueue != nullptr);
         assert(desc.textureCount > 0);
@@ -2206,6 +2301,14 @@ namespace plume {
 
         if (compatibleSurfaceFormats.empty()) {
             fprintf(stderr, "No compatible surface formats were found.\n");
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "No compatible surface format: requested=%d, available=%u",
+                int(requestedFormat), surfaceFormatCount);
+            for (const VkSurfaceFormatKHR &surfaceFormat : surfaceFormats) {
+                __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "Available surface format=%d, colorSpace=%d",
+                    int(surfaceFormat.format), int(surfaceFormat.colorSpace));
+            }
+#endif
             return;
         }
 
@@ -2238,9 +2341,15 @@ namespace plume {
 
         // Parent command queue should track this swap chain.
         commandQueue->swapChains.insert(this);
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        SDL_AddEventWatch(androidEventWatch, this);
+#endif
     }
 
     VulkanSwapChain::~VulkanSwapChain() {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        SDL_DelEventWatch(androidEventWatch, this);
+#endif
         releaseImageViews();
         releaseSwapChain();
 
@@ -2248,6 +2357,12 @@ namespace plume {
             VulkanInterface *renderInterface = commandQueue->device->renderInterface;
             vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
         }
+
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (recoveredAndroidWindow != nullptr) {
+            ANativeWindow_release(recoveredAndroidWindow);
+        }
+#endif
 
         // Remove tracking from the parent command queue.
         commandQueue->swapChains.erase(this);
@@ -2285,6 +2400,11 @@ namespace plume {
             const std::scoped_lock queueLock(*commandQueue->queue->mutex);
             res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
         }
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (res == VK_ERROR_SURFACE_LOST_KHR) {
+            androidSurfaceLost = true;
+        }
+#endif
 
 #if defined(__APPLE__)
         // Under MoltenVK, VK_SUBOPTIMAL_KHR does not result in a valid state for rendering. We intentionally
@@ -2310,29 +2430,72 @@ namespace plume {
     }
 
     bool VulkanSwapChain::resize() {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (androidBackground.load(std::memory_order_acquire)) {
+            return false;
+        }
+#endif
         getWindowSize(width, height);
-
-        // Don't recreate the swap chain at all if the window doesn't have a valid size.
         if ((width == 0) || (height == 0)) {
             return false;
         }
 
-        // Destroy any image view references to the current swap chain.
+        // The caller has released framebuffers. Also finish queued presents
+        // before destroying their swapchain images or reusing semaphores.
+        {
+            const std::scoped_lock queueLock(*commandQueue->queue->mutex);
+            if (vkQueueWaitIdle(commandQueue->queue->vk) != VK_SUCCESS) {
+                return false;
+            }
+        }
         releaseImageViews();
 
-        // Query surface capabilities to get the valid extent bounds.
-        VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
-        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities);
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        const uint64_t generation = androidSurfaceGeneration.load(std::memory_order_acquire);
+        if (androidSurfaceLost || (generation != createdSurfaceGeneration) || (surface == VK_NULL_HANDLE)) {
+            releaseSwapChain();
+            if (surface != VK_NULL_HANDLE) {
+                vkDestroySurfaceKHR(commandQueue->device->renderInterface->instance, surface, nullptr);
+                surface = VK_NULL_HANDLE;
+            }
+            if (recoveredAndroidWindow != nullptr) {
+                ANativeWindow_release(recoveredAndroidWindow);
+                recoveredAndroidWindow = nullptr;
+            }
+            if (!recreateAndroidSurface()) {
+                return false;
+            }
+            createdSurfaceGeneration = generation;
+        }
+#endif
 
-        // Clamp the extent to the surface capabilities' min/max bounds.
-        // This is required because the window size may differ from the valid surface extent
-        // (e.g., due to window decorations, compositor behavior, or timing issues).
-        width = std::clamp(width, surfaceCapabilities.minImageExtent.width, surfaceCapabilities.maxImageExtent.width);
-        height = std::clamp(height, surfaceCapabilities.minImageExtent.height, surfaceCapabilities.maxImageExtent.height);
+        VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
+        VkResult res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities);
+        if (res != VK_SUCCESS) {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+            androidSurfaceLost = (res == VK_ERROR_SURFACE_LOST_KHR);
+#endif
+            return false;
+        }
+
+        if (surfaceCapabilities.currentExtent.width != UINT32_MAX) {
+            width = surfaceCapabilities.currentExtent.width;
+            height = surfaceCapabilities.currentExtent.height;
+        }
+        else {
+            width = std::clamp(width, surfaceCapabilities.minImageExtent.width, surfaceCapabilities.maxImageExtent.width);
+            height = std::clamp(height, surfaceCapabilities.minImageExtent.height, surfaceCapabilities.maxImageExtent.height);
+        }
+        if ((width == 0) || (height == 0)) {
+            return false;
+        }
 
         createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         createInfo.surface = surface;
-        createInfo.minImageCount = desc.textureCount;
+        createInfo.minImageCount = std::max(desc.textureCount, surfaceCapabilities.minImageCount);
+        if (surfaceCapabilities.maxImageCount > 0) {
+            createInfo.minImageCount = std::min(createInfo.minImageCount, surfaceCapabilities.maxImageCount);
+        }
         createInfo.imageFormat = pickedSurfaceFormat.format;
         createInfo.imageColorSpace = pickedSurfaceFormat.colorSpace;
         createInfo.imageExtent.width = width;
@@ -2340,17 +2503,27 @@ namespace plume {
         createInfo.imageArrayLayers = 1;
         createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        createInfo.preTransform = (surfaceCapabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : surfaceCapabilities.currentTransform;
         createInfo.compositeAlpha = pickedAlphaFlag;
         createInfo.presentMode = requiredPresentMode;
         createInfo.clipped = VK_TRUE;
         createInfo.oldSwapchain = vk;
 
-        VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
+        // Creation retires oldSwapchain even on failure. Never overwrite its
+        // only handle with an undefined/null output and leak the native window.
+        VkSwapchainKHR newSwapChain = VK_NULL_HANDLE;
+        res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &newSwapChain);
+        releaseSwapChain();
+        createInfo.oldSwapchain = VK_NULL_HANDLE;
         if (res != VK_SUCCESS) {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+            androidSurfaceLost = (res == VK_ERROR_SURFACE_LOST_KHR);
+#endif
             fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
             return false;
         }
+        vk = newSwapChain;
 
         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
         createdPresentMode = requiredPresentMode;
@@ -2358,13 +2531,11 @@ namespace plume {
         // Reset present counter.
         presentCount = 1;
 
-        if (createInfo.oldSwapchain != VK_NULL_HANDLE) {
-            vkDestroySwapchainKHR(commandQueue->device->vk, createInfo.oldSwapchain, nullptr);
-        }
+        currentPresentId = 0;
 
         uint32_t retrievedImageCount = 0;
-        vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &retrievedImageCount, nullptr);
-        if (retrievedImageCount < desc.textureCount) {
+        res = vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &retrievedImageCount, nullptr);
+        if ((res != VK_SUCCESS) || (retrievedImageCount < createInfo.minImageCount)) {
             releaseSwapChain();
             fprintf(stderr, "Image count differs from the texture count.\n");
             return false;
@@ -2401,6 +2572,11 @@ namespace plume {
     }
 
     bool VulkanSwapChain::needsResize() const {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (androidSurfaceLost || (androidSurfaceGeneration.load(std::memory_order_acquire) != createdSurfaceGeneration)) {
+            return true;
+        }
+#endif
         uint32_t windowWidth, windowHeight;
         getWindowSize(windowWidth, windowHeight);
         return (vk == VK_NULL_HANDLE) || (windowWidth != width) || (windowHeight != height) || (requiredPresentMode != createdPresentMode);
@@ -2447,6 +2623,9 @@ namespace plume {
     }
 
     uint32_t VulkanSwapChain::getRefreshRate() const {
+        if (isEmpty()) {
+            return 0;
+        }
         VkRefreshCycleDurationGOOGLE refreshCycle = {};
         VkResult res = vkGetRefreshCycleDurationGOOGLE(commandQueue->device->vk, vk, &refreshCycle);
         if (res != VK_SUCCESS) {
@@ -2486,7 +2665,25 @@ namespace plume {
         assert(signalSemaphore != nullptr);
 
         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
-        VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
+        if (isEmpty()) {
+            return false;
+        }
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (androidBackground.load(std::memory_order_acquire) || androidSurfaceLost ||
+            (androidSurfaceGeneration.load(std::memory_order_acquire) != createdSurfaceGeneration)) {
+            return false;
+        }
+        // Android may stop supplying images before the lifecycle event arrives.
+        constexpr uint64_t acquireTimeout = 100000000;
+#else
+        constexpr uint64_t acquireTimeout = UINT64_MAX;
+#endif
+        VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, acquireTimeout, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        if (res == VK_ERROR_SURFACE_LOST_KHR) {
+            androidSurfaceLost = true;
+        }
+#endif
         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
             return false;
         }
@@ -2594,13 +2791,16 @@ namespace plume {
             depthReference.attachment = uint32_t(attachments.size());
             depthReference.layout = desc.depthAttachmentReadOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-            // Upgrade the operations to NONE if supported. Fixes the following validation issue: https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/2349
-            // We prefer to just ignore this potential hazard on older Vulkan versions as it just seems to be an edge case for some hardware.
+            // Read-only depth/stencil still needs its previous contents for depth tests.
+            // LOAD_OP_NONE makes them undefined inside the render pass. Only the store
+            // can be omitted: read-only attachments do not modify the loaded values.
+            // STORE_OP_NONE also avoids the read/store hazard described in:
+            // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/2349
             const bool preferNoneForReadOnly = desc.depthAttachmentReadOnly && device->loadStoreOpNoneSupported;
             VkAttachmentDescription attachment = {};
             attachment.format = toVk(depthAttachmentViewDesc.format);
             attachment.samples = VkSampleCountFlagBits(depthAttachment->desc.multisampling.sampleCount);
-            attachment.loadOp = preferNoneForReadOnly ? VK_ATTACHMENT_LOAD_OP_NONE_EXT : VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             attachment.storeOp = preferNoneForReadOnly ? VK_ATTACHMENT_STORE_OP_NONE_EXT : VK_ATTACHMENT_STORE_OP_STORE;
             attachment.stencilLoadOp = attachment.loadOp;
             attachment.stencilStoreOp = attachment.storeOp;
@@ -2940,17 +3140,35 @@ namespace plume {
     }
 
     void VulkanCommandList::setPipeline(const RenderPipeline *pipeline) {
+#if defined(__ANDROID__)
+        if (pipeline == nullptr) {
+            __android_log_print(ANDROID_LOG_FATAL, "Dora64Vulkan", "Attempted to bind a null pipeline object");
+            std::abort();
+        }
+#endif
         assert(pipeline != nullptr);
 
         const VulkanPipeline *interfacePipeline = static_cast<const VulkanPipeline *>(pipeline);
         switch (interfacePipeline->type) {
         case VulkanPipeline::Type::Compute: {
             const VulkanComputePipeline *computePipeline = static_cast<const VulkanComputePipeline *>(interfacePipeline);
+#if defined(__ANDROID__)
+            if (computePipeline->vk == VK_NULL_HANDLE) {
+                __android_log_print(ANDROID_LOG_FATAL, "Dora64Vulkan", "Attempted to bind a failed compute pipeline");
+                std::abort();
+            }
+#endif
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
             break;
         }
         case VulkanPipeline::Type::Graphics: {
             const VulkanGraphicsPipeline *graphicsPipeline = static_cast<const VulkanGraphicsPipeline *>(interfacePipeline);
+#if defined(__ANDROID__)
+            if (graphicsPipeline->vk == VK_NULL_HANDLE) {
+                __android_log_print(ANDROID_LOG_FATAL, "Dora64Vulkan", "Attempted to bind a failed graphics pipeline");
+                std::abort();
+            }
+#endif
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline->vk);
             break;
         }
@@ -4467,6 +4685,9 @@ namespace plume {
         VkResult res = volkInitialize();
         if (res != VK_SUCCESS) {
             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "volkInitialize failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
 
@@ -4475,7 +4696,31 @@ namespace plume {
         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.pEngineName = "plume";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.apiVersion = VK_API_VERSION_1_2;
+        uint32_t availableInstanceVersion = VK_API_VERSION_1_0;
+        if (vkEnumerateInstanceVersion != nullptr) {
+            res = vkEnumerateInstanceVersion(&availableInstanceVersion);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vkEnumerateInstanceVersion failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+                __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkEnumerateInstanceVersion failed: VkResult=%d", static_cast<int>(res));
+#endif
+                return;
+            }
+        }
+
+        // The device path uses core Vulkan 1.1 feature queries. Request no more than
+        // the loader supports; requiring 1.2 rejects otherwise compatible devices.
+        if (availableInstanceVersion < VK_API_VERSION_1_1) {
+            fprintf(stderr, "Vulkan 1.1 is required by Plume.\n");
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "Vulkan loader supports only version %u.%u", VK_API_VERSION_MAJOR(availableInstanceVersion), VK_API_VERSION_MINOR(availableInstanceVersion));
+#endif
+            return;
+        }
+        appInfo.apiVersion = std::min(availableInstanceVersion, uint32_t(VK_API_VERSION_1_2));
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "Dora64Vulkan", "Requesting Vulkan instance version %u.%u", VK_API_VERSION_MAJOR(appInfo.apiVersion), VK_API_VERSION_MINOR(appInfo.apiVersion));
+#endif
 
         VkInstanceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -4539,6 +4784,11 @@ namespace plume {
             }
 
             fprintf(stderr, "Unable to create instance. Required extensions are missing.\n");
+#if defined(__ANDROID__)
+            for (const std::string &extension : missingRequiredExtensions) {
+                __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "Missing required instance extension: %s", extension.c_str());
+            }
+#endif
             return;
         }
 
@@ -4576,6 +4826,9 @@ namespace plume {
         res = vkCreateInstance(&createInfo, nullptr, &instance);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "Dora64Vulkan", "vkCreateInstance failed: VkResult=%d", static_cast<int>(res));
+#endif
             return;
         }
 
