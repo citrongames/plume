@@ -9,10 +9,15 @@
 
 #include "plume_render_interface.h"
 
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+#include <SDL_events.h>
+#endif
 
 #if defined(_WIN64)
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -244,6 +249,15 @@ namespace plume {
         uint64_t currentPresentId = 0;
         bool immediatePresentModeSupported = false;
         bool mailboxPresentModeSupported = false;
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        std::atomic<bool> androidBackground{false};
+        std::atomic<uint64_t> androidSurfaceGeneration{0};
+        uint64_t createdSurfaceGeneration = 0;
+        ANativeWindow *recoveredAndroidWindow = nullptr;
+        bool androidSurfaceLost = false;
+        static int SDLCALL androidEventWatch(void *userdata, SDL_Event *event);
+        bool recreateAndroidSurface();
+#endif
 
         VulkanSwapChain(VulkanCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
         ~VulkanSwapChain() override;
