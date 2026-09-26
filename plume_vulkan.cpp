@@ -14,6 +14,11 @@
 #include <cmath>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <cstdio>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -1461,7 +1466,8 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.stage = stageInfo;
 
-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+        if (res == VK_SUCCESS) device->pipelineCreated();
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
 #if defined(__ANDROID__)
@@ -1720,7 +1726,8 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.renderPass = renderPass;
 
-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+        if (res == VK_SUCCESS) device->pipelineCreated();
         // Some drivers report shader link failures as VK_ERROR_UNKNOWN. Expose
         // this to the renderer so it can retry a compatible shader before bind.
         // Never retry resource exhaustion, device loss, or other fatal errors.
@@ -4373,6 +4380,8 @@ namespace plume {
             return;
         }
 
+        initializePipelineCache();
+
         for (uint32_t i = 0; i < queueFamilyCount; i++) {
             for (uint32_t j = 0; j < queueFamilies[i].queues.size(); j++) {
                 vkGetDeviceQueue(vk, i, j, &queueFamilies[i].queues[j].vk);
@@ -4438,6 +4447,23 @@ namespace plume {
         description.dedicatedVideoMemory = memoryHeapSize;
 
         // Fill capabilities.
+#if defined(__ANDROID__)
+        // Native framebuffer shaders declare R32ui/Rgba32f storage. Match
+        // those formats exactly, including on drivers that happen to accept
+        // mismatched narrow formats. R32 storage is mandatory in Vulkan.
+        capabilities.nativeFramebuffer32Bit = true;
+        fprintf(stderr, "Dora64: using native framebuffer storage buffers and format-matched images\n");
+        capabilities.localTextureDescriptors = !indexingFeatures.shaderSampledImageArrayNonUniformIndexing ||
+            physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages < 2050 ||
+            physicalDeviceProperties.limits.maxDescriptorSetSampledImages < 2050 ||
+            physicalDeviceProperties.limits.maxPerStageDescriptorSamplers < 18;
+        if (capabilities.localTextureDescriptors) {
+            fprintf(stderr, "Dora64: using local texture descriptors (images=%u samplers=%u nonuniform=%u)\n",
+                physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages,
+                physicalDeviceProperties.limits.maxPerStageDescriptorSamplers,
+                indexingFeatures.shaderSampledImageArrayNonUniformIndexing);
+        }
+#endif
         capabilities.dualSourceBlend = deviceFeatures.features.dualSrcBlend;
         capabilities.independentBlend = deviceFeatures.features.independentBlend;
         capabilities.maxColorAttachments = physicalDeviceProperties.limits.maxColorAttachments;
@@ -4750,6 +4776,112 @@ namespace plume {
         }
     }
 
+
+    // Versioned envelope rejects truncated/corrupted data before handing it to
+    // the driver. The file key also isolates GPU, driver and pipeline-cache UUID.
+    static uint64_t pipelineCacheChecksum(const std::vector<uint8_t> &data) {
+        uint64_t hash = 14695981039346656037ULL;
+        for (uint8_t byte : data) hash = (hash ^ byte) * 1099511628211ULL;
+        return hash;
+    }
+
+    void VulkanDevice::initializePipelineCache() {
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        const char *directory = SDL_AndroidGetInternalStoragePath();
+        if (!directory || !directory[0]) return;
+        std::ostringstream path;
+        path << directory << "/vk-pipelines-v1-" << std::hex
+             << physicalDeviceProperties.vendorID << '-'
+             << physicalDeviceProperties.deviceID << '-'
+             << physicalDeviceProperties.driverVersion << '-';
+        for (uint8_t byte : physicalDeviceProperties.pipelineCacheUUID)
+            path << std::setw(2) << std::setfill('0') << unsigned(byte);
+        pipelineCachePath = path.str() + ".bin";
+        constexpr size_t maxSize = 128 * 1024 * 1024;
+        std::vector<uint8_t> data;
+        std::ifstream file(pipelineCachePath, std::ios::binary | std::ios::ate);
+        if (file && file.tellg() >= std::streamoff(48) && file.tellg() <= std::streamoff(maxSize + 16)) {
+            const size_t size = size_t(file.tellg()) - 16;
+            file.seekg(0);
+            uint64_t envelope[2] = {};
+            file.read(reinterpret_cast<char *>(envelope), sizeof(envelope));
+            data.resize(size);
+            file.read(reinterpret_cast<char *>(data.data()), size);
+            uint32_t header[4] = {};
+            std::memcpy(header, data.data(), sizeof(header));
+            if (!file || envelope[0] != size || envelope[1] != pipelineCacheChecksum(data) ||
+                header[0] < 32 || header[0] > size || header[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+                header[2] != physicalDeviceProperties.vendorID || header[3] != physicalDeviceProperties.deviceID ||
+                std::memcmp(data.data() + 16, physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE) != 0) {
+                data.clear();
+                fprintf(stderr, "Dora64: ignored invalid Vulkan pipeline cache\n");
+            }
+        }
+        VkPipelineCacheCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        // Flags 0: Vulkan synchronizes concurrent pipeline compilation internally.
+        info.initialDataSize = data.size();
+        info.pInitialData = data.empty() ? nullptr : data.data();
+        VkResult result = vkCreatePipelineCache(vk, &info, nullptr, &pipelineCache);
+        if (result != VK_SUCCESS && !data.empty()) {
+            data.clear();
+            info.initialDataSize = 0;
+            info.pInitialData = nullptr;
+            result = vkCreatePipelineCache(vk, &info, nullptr, &pipelineCache);
+        }
+        pipelineCacheLastSave = std::chrono::steady_clock::now();
+        fprintf(stderr, "Dora64: Vulkan pipeline cache loaded %zu bytes (result=%d)\n", data.size(), int(result));
+#endif
+    }
+
+    void VulkanDevice::pipelineCreated() {
+        if (pipelineCache == VK_NULL_HANDLE) return;
+        pipelineCacheDirty.store(true);
+        savePipelineCacheImpl(false);
+    }
+
+    void VulkanDevice::savePipelineCache() {
+        savePipelineCacheImpl(true);
+    }
+
+    void VulkanDevice::savePipelineCacheImpl(bool force) {
+        if (pipelineCache == VK_NULL_HANDLE || pipelineCachePath.empty()) return;
+        std::unique_lock<std::mutex> lock(pipelineCacheSaveMutex, std::defer_lock);
+        if (force) lock.lock();
+        else if (!lock.try_lock()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - pipelineCacheLastSave < std::chrono::seconds(30)) return;
+        if (!pipelineCacheDirty.exchange(false)) return;
+        pipelineCacheLastSave = now;
+        size_t size = 0;
+        VkResult result = vkGetPipelineCacheData(vk, pipelineCache, &size, nullptr);
+        if (result != VK_SUCCESS || size < 32 || size > 128 * 1024 * 1024) {
+            pipelineCacheDirty.store(true);
+            return;
+        }
+        std::vector<uint8_t> data(size);
+        result = vkGetPipelineCacheData(vk, pipelineCache, &size, data.data());
+        // Concurrent compilers can enlarge the cache; retry at the next checkpoint
+        // instead of replacing a complete cache with a partial snapshot.
+        if (result != VK_SUCCESS || size < 32) {
+            pipelineCacheDirty.store(true);
+            return;
+        }
+        data.resize(size);
+        const uint64_t envelope[] = { uint64_t(size), pipelineCacheChecksum(data) };
+        const std::string temporary = pipelineCachePath + ".tmp";
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char *>(envelope), sizeof(envelope));
+        file.write(reinterpret_cast<const char *>(data.data()), data.size());
+        file.close();
+        if (!file || std::rename(temporary.c_str(), pipelineCachePath.c_str()) != 0) {
+            pipelineCacheDirty.store(true);
+            fprintf(stderr, "Dora64: could not save Vulkan pipeline cache\n");
+            return;
+        }
+        fprintf(stderr, "Dora64: saved Vulkan pipeline cache (%zu bytes)\n", size);
+    }
+
     void VulkanDevice::release() {
         nullBuffer = nullptr; // force destruction before destroying allocator
 
@@ -4759,6 +4891,11 @@ namespace plume {
         }
 
         if (vk != VK_NULL_HANDLE) {
+            savePipelineCache();
+            if (pipelineCache != VK_NULL_HANDLE) {
+                vkDestroyPipelineCache(vk, pipelineCache, nullptr);
+                pipelineCache = VK_NULL_HANDLE;
+            }
             vkDestroyDevice(vk, nullptr);
             vk = VK_NULL_HANDLE;
         }

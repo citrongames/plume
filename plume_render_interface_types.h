@@ -1791,6 +1791,8 @@ namespace plume {
         bool displayTiming = false;
 
         // Blending. Other backends retain their existing dual-source path.
+        bool nativeFramebuffer32Bit = false; // Format-matched packed native framebuffer stores.
+        bool localTextureDescriptors = false; // Small per-draw sets on limited Vulkan devices.
         bool dualSourceBlend = true;
         bool independentBlend = true;
         uint32_t maxColorAttachments = 8;

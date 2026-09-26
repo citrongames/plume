@@ -10,6 +10,7 @@
 #include "plume_render_interface.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -423,6 +424,15 @@ namespace plume {
 
     struct VulkanDevice : RenderDevice {
         VkDevice vk = VK_NULL_HANDLE;
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+        std::string pipelineCachePath;
+        std::mutex pipelineCacheSaveMutex;
+        std::atomic<bool> pipelineCacheDirty{false};
+        std::chrono::steady_clock::time_point pipelineCacheLastSave{};
+        void initializePipelineCache();
+        void pipelineCreated();
+        void savePipelineCache() override;
+        void savePipelineCacheImpl(bool force);
         VulkanInterface *renderInterface = nullptr;
         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         VkPhysicalDeviceProperties physicalDeviceProperties = {};
