@@ -191,6 +191,8 @@ namespace plume {
     };
 
     struct VulkanGraphicsPipeline : VulkanPipeline {
+        CreationStatus creationStatus = CreationStatus::FatalFailure;
+        CreationStatus getCreationStatus() const override { return creationStatus; }
         VkPipeline vk = VK_NULL_HANDLE;
         VkRenderPass renderPass = VK_NULL_HANDLE;
 

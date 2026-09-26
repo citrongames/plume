@@ -56,6 +56,9 @@ namespace plume {
     };
 
     struct RenderPipeline {
+        enum class CreationStatus { Success, RetryableFailure, FatalFailure };
+        // Backends that expose recoverable creation errors override this.
+        virtual CreationStatus getCreationStatus() const { return CreationStatus::Success; }
         virtual ~RenderPipeline() { }
         virtual void setName(const std::string &name) = 0;
         virtual RenderPipelineProgram getProgram(const std::string &name) const = 0;

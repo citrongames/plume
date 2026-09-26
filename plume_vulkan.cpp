@@ -17,6 +17,7 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <sys/prctl.h>
 #if defined(PLUME_SDL_VULKAN_ENABLED)
 #include <android/native_window_jni.h>
 #include <SDL_system.h>
@@ -37,6 +38,23 @@
 // - Fix resource pools.
 
 namespace plume {
+    // Framebuffer contents survive pass breaks (including barriers for unrelated
+    // resources). LOAD/STORE alone do not synchronize separate pass instances.
+    // Explicit image barriers still handle transfers, sampling and layout changes.
+    static VkSubpassDependency attachmentLoadDependency() {
+        VkSubpassDependency dependency = {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependency.dstStageMask = dependency.srcStageMask;
+        dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependency.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+        return dependency;
+    }
+
     // Backend constants.
 
     // Required buffer alignment for acceleration structures.
@@ -912,6 +930,7 @@ namespace plume {
     }
 
     void *VulkanBuffer::map(uint32_t subresource, const RenderRange *readRange) {
+        assert((readRange == nullptr) || ((readRange->begin <= readRange->end) && (readRange->end <= desc.size)));
         void *data = nullptr;
         VkResult res = vmaMapMemory(device->allocator, allocation, &data);
         if (res != VK_SUCCESS) {
@@ -919,10 +938,39 @@ namespace plume {
             return nullptr;
         }
 
+        // GPU completion does not invalidate non-coherent CPU caches. The
+        // caller must wait for GPU writes before mapping; make those writes
+        // visible before it reads. Null means the whole allocation, an empty
+        // range means no CPU reads. VMA handles atom alignment and is a no-op
+        // on HOST_COHERENT memory.
+        if ((readRange == nullptr) || (readRange->begin < readRange->end)) {
+            const VkDeviceSize offset = (readRange != nullptr) ? readRange->begin : 0;
+            const VkDeviceSize size = (readRange != nullptr) ? readRange->end - readRange->begin : VK_WHOLE_SIZE;
+            res = vmaInvalidateAllocation(device->allocator, allocation, offset, size);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vmaInvalidateAllocation failed with error code 0x%X.\n", res);
+                vmaUnmapMemory(device->allocator, allocation);
+                return nullptr;
+            }
+        }
+
         return data;
     }
 
     void VulkanBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
+        assert((writtenRange == nullptr) || ((writtenRange->begin <= writtenRange->end) && (writtenRange->end <= desc.size)));
+        // Unmapping alone does not publish CPU writes to non-coherent memory.
+        // Flush while the allocation is still mapped, before GPU submission.
+        if ((writtenRange == nullptr) || (writtenRange->begin < writtenRange->end)) {
+            const VkDeviceSize offset = (writtenRange != nullptr) ? writtenRange->begin : 0;
+            const VkDeviceSize size = (writtenRange != nullptr) ? writtenRange->end - writtenRange->begin : VK_WHOLE_SIZE;
+            const VkResult res = vmaFlushAllocation(device->allocator, allocation, offset, size);
+            if (res != VK_SUCCESS) {
+                fprintf(stderr, "vmaFlushAllocation failed with error code 0x%X.\n", res);
+                std::abort();
+            }
+        }
+
         vmaUnmapMemory(device->allocator, allocation);
     }
 
@@ -1523,15 +1571,12 @@ namespace plume {
             inputAssembly.primitiveRestartEnable = VK_TRUE;
         }
 
-        uint32_t renderTargetCount = desc.renderTargetCount;
-        if (renderTargetCount == 0 && desc.depthTargetFormat != RenderFormat::UNKNOWN) {
-            renderTargetCount = 1;
-        }
-
+        // Color attachment count is unrelated to viewport count. Plume's
+        // pipelines use one viewport, including MRT coverage rendering.
         VkPipelineViewportStateCreateInfo viewportState = {};
         viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewportState.viewportCount = renderTargetCount;
-        viewportState.scissorCount = renderTargetCount;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
 
         VkPipelineRasterizationStateCreateInfo rasterization = {};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -1676,6 +1721,15 @@ namespace plume {
         pipelineInfo.renderPass = renderPass;
 
         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
+        // Some drivers report shader link failures as VK_ERROR_UNKNOWN. Expose
+        // this to the renderer so it can retry a compatible shader before bind.
+        // Never retry resource exhaustion, device loss, or other fatal errors.
+        if (res == VK_SUCCESS) {
+            creationStatus = CreationStatus::Success;
+        }
+        else if ((res == VK_ERROR_UNKNOWN) || (res == VK_ERROR_INVALID_SHADER_NV)) {
+            creationStatus = CreationStatus::RetryableFailure;
+        }
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
 #if defined(__ANDROID__)
@@ -1764,6 +1818,9 @@ namespace plume {
         passInfo.attachmentCount = uint32_t(attachments.size());
         passInfo.pSubpasses = &subpass;
         passInfo.subpassCount = 1;
+        const VkSubpassDependency attachmentDependency = attachmentLoadDependency();
+        passInfo.dependencyCount = 1;
+        passInfo.pDependencies = &attachmentDependency;
 
         VkResult res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &renderPass);
         if (res == VK_SUCCESS) {
@@ -2824,6 +2881,9 @@ namespace plume {
         passInfo.attachmentCount = uint32_t(attachments.size());
         passInfo.pSubpasses = &subpass;
         passInfo.subpassCount = 1;
+        const VkSubpassDependency attachmentDependency = attachmentLoadDependency();
+        passInfo.dependencyCount = 1;
+        passInfo.pDependencies = &attachmentDependency;
 
         res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &renderPass);
         if (res != VK_SUCCESS) {
@@ -3401,6 +3461,26 @@ namespace plume {
         vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
     }
 
+    static void publishReadbackCopy(VkCommandBuffer commandBuffer, const VulkanBuffer *buffer, const VkBufferCopy &copy) {
+        if (buffer->desc.heapType != RenderHeapType::READBACK) {
+            return;
+        }
+
+        // The fence wait and map-time invalidation consume this dependency.
+        // Keep this Vulkan-specific: D3D12 readback heaps stay in COPY_DEST.
+        VkBufferMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffer->vk;
+        barrier.offset = copy.dstOffset;
+        barrier.size = copy.size;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            0, 0, nullptr, 1, &barrier, 0, nullptr);
+    }
+
     void VulkanCommandList::copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) {
         endActiveRenderPass();
 
@@ -3414,6 +3494,7 @@ namespace plume {
         bufferCopy.srcOffset = srcBuffer.offset;
         bufferCopy.size = size;
         vkCmdCopyBuffer(vk, interfaceSrcBuffer->vk, interfaceDstBuffer->vk, 1, &bufferCopy);
+        publishReadbackCopy(vk, interfaceDstBuffer, bufferCopy);
     }
 
     void VulkanCommandList::copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) {
@@ -3495,6 +3576,7 @@ namespace plume {
         bufferCopy.srcOffset = 0;
         bufferCopy.size = interfaceDstBuffer->desc.size;
         vkCmdCopyBuffer(vk, interfaceSrcBuffer->vk, interfaceDstBuffer->vk, 1, &bufferCopy);
+        publishReadbackCopy(vk, interfaceDstBuffer, bufferCopy);
     }
 
     void VulkanCommandList::copyTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) {
@@ -3853,7 +3935,25 @@ namespace plume {
         assert(fence != nullptr);
 
         VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
+#if defined(__ANDROID__)
+        VkResult res;
+        unsigned timeouts = 0;
+        do {
+            res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, 5000000000ULL);
+            if (res == VK_TIMEOUT && (timeouts++ % 6) == 0) {
+                char name[16] = {};
+                prctl(PR_GET_NAME, name);
+                fprintf(stderr, "Dora64 GPU fence timeout: thread=%s family=%u queue=%p fence=%p seconds=%u\n",
+                    name, familyIndex, (void *)queue->vk, (void *)interfaceFence->vk, timeouts * 5);
+                fflush(stderr);
+            }
+        } while (res == VK_TIMEOUT);
+        if (timeouts && res == VK_SUCCESS) {
+            fprintf(stderr, "Dora64 GPU fence resumed after at least %u seconds.\n", timeouts * 5);
+        }
+#else
         VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
+#endif
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
             return;
@@ -4338,6 +4438,9 @@ namespace plume {
         description.dedicatedVideoMemory = memoryHeapSize;
 
         // Fill capabilities.
+        capabilities.dualSourceBlend = deviceFeatures.features.dualSrcBlend;
+        capabilities.independentBlend = deviceFeatures.features.independentBlend;
+        capabilities.maxColorAttachments = physicalDeviceProperties.limits.maxColorAttachments;
         capabilities.geometryShader = deviceFeatures.features.geometryShader;
         capabilities.raytracing = rayTracingSupported;
         capabilities.raytracingStateUpdate = false;

@@ -1790,6 +1790,11 @@ namespace plume {
         bool presentWait = false;
         bool displayTiming = false;
 
+        // Blending. Other backends retain their existing dual-source path.
+        bool dualSourceBlend = true;
+        bool independentBlend = true;
+        uint32_t maxColorAttachments = 8;
+
         // Framebuffers.
         uint64_t maxTextureSize = 0;
 
